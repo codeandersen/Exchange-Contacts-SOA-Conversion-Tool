@@ -1,0 +1,1204 @@
+#Requires -Version 5.1
+
+<#
+        .SYNOPSIS
+        Exchange Contacts SOA Conversion Tool (Cloud / On-Prem Source of Authority)
+
+        .DESCRIPTION
+        GUI tool to manage Contact Source of Authority (SOA) conversion between cloud-managed and on-premises-managed
+        by toggling the contact property `isCloudManaged` via the Microsoft Graph onPremisesSyncBehavior API.
+        
+        The tool connects to Microsoft Graph, lists all organizational contacts, and supports converting
+        contacts between cloud-managed and on-premises-managed.
+        
+        Features:
+        - Automatic permission consent flow for required Graph API permissions
+        - Display all organizational contacts with their current SOA status (Cloud Managed: True/False)
+        - Optional filter to hide already converted (cloud-managed) contacts
+        - Pagination support for large contact lists
+        
+        This tool is intended to support the approach described in:
+        https://learn.microsoft.com/en-us/entra/identity/hybrid/how-to-user-source-of-authority-configure#configure-contact-soa
+
+        .PARAMETER TenantId
+        Optional. The Entra ID (Azure AD) tenant ID (GUID) to connect to.
+        If not specified, the tool connects to the signed-in user's home tenant.
+        Recommended in multi-tenant or partner scenarios to ensure you connect to the correct tenant.
+
+        .EXAMPLE
+        C:\PS> .\Exchange-Contacts-SOA-Conversion-Tool.ps1
+
+        .EXAMPLE
+        C:\PS> .\Exchange-Contacts-SOA-Conversion-Tool.ps1 -TenantId "00000000-0000-0000-0000-000000000000"
+
+        .NOTES
+        Version: 1.00
+        
+        REQUIREMENTS:
+        - Microsoft.Graph.Identity.DirectoryManagement PowerShell module
+        - Consent to the 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' permission in Microsoft Graph
+          (The tool will automatically prompt for consent when you connect)
+
+        .COPYRIGHT
+        MIT License, feel free to distribute and use as you like, please leave author information.
+
+       .LINK
+        https://learn.microsoft.com/en-us/entra/identity/hybrid/how-to-user-source-of-authority-configure#configure-contact-soa
+        
+        BLOG: http://www.hcandersen.net
+        Twitter: @dk_hcandersen
+        LinkedIn: https://www.linkedin.com/in/hanschrandersen/
+
+        .DISCLAIMER
+        This script is provided AS-IS, with no warranty - Use at own risk.
+    #>
+
+param(
+    [Parameter(Mandatory=$false, HelpMessage="Enter the Entra ID (Azure AD) tenant ID (GUID) to connect to.")]
+    [string]$TenantId
+)
+
+$script:Version = "1.00"
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$script:ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:LogFile = Join-Path $script:ScriptPath "ContactSOAConversion_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
+$script:AllContacts = @()
+$script:AllContactsUnfiltered = @()
+$script:CurrentPage = 1
+$script:PageSize = 100
+$script:PermissionOk = $false
+$script:TenantId = $TenantId
+$script:HideConverted = $false
+$script:SortColumn = ""
+$script:SortDirection = "Ascending"
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('INFO','WARNING','ERROR')]
+        [string]$Level = 'INFO'
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+    
+    $retries = 3
+    for ($i = 0; $i -lt $retries; $i++) {
+        try {
+            [System.IO.File]::AppendAllText($script:LogFile, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
+            break
+        }
+        catch {
+            if ($i -eq ($retries - 1)) { Write-Host "WARNING: Could not write to log file: $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    
+    Write-Host $logEntry
+}
+
+function Update-ContactGrid {
+    param(
+        [Parameter(Mandatory=$false)]
+        [array]$Contacts = $null
+    )
+    
+    if ($null -ne $Contacts) {
+        $script:AllContactsUnfiltered = $Contacts
+    }
+    
+    if ($script:HideConverted) {
+        $script:AllContacts = $script:AllContactsUnfiltered | Where-Object { $_.IsCloudManaged -ne $true }
+    } else {
+        $script:AllContacts = $script:AllContactsUnfiltered
+    }
+    
+    # Apply sorting if a column is selected
+    if ($script:SortColumn -ne "") {
+        $script:AllContacts = switch ($script:SortColumn) {
+            "DisplayName" {
+                if ($script:SortDirection -eq "Ascending") {
+                    $script:AllContacts | Sort-Object -Property DisplayName
+                } else {
+                    $script:AllContacts | Sort-Object -Property DisplayName -Descending
+                }
+            }
+            "Email" {
+                if ($script:SortDirection -eq "Ascending") {
+                    $script:AllContacts | Sort-Object -Property Mail
+                } else {
+                    $script:AllContacts | Sort-Object -Property Mail -Descending
+                }
+            }
+            "Company" {
+                if ($script:SortDirection -eq "Ascending") {
+                    $script:AllContacts | Sort-Object -Property CompanyName
+                } else {
+                    $script:AllContacts | Sort-Object -Property CompanyName -Descending
+                }
+            }
+            "SyncedOnPrem" {
+                if ($script:SortDirection -eq "Ascending") {
+                    $script:AllContacts | Sort-Object -Property SyncedOnPrem
+                } else {
+                    $script:AllContacts | Sort-Object -Property SyncedOnPrem -Descending
+                }
+            }
+            "IsCloudManaged" {
+                if ($script:SortDirection -eq "Ascending") {
+                    $script:AllContacts | Sort-Object -Property IsCloudManaged
+                } else {
+                    $script:AllContacts | Sort-Object -Property IsCloudManaged -Descending
+                }
+            }
+            default { $script:AllContacts }
+        }
+    }
+    
+    $totalContacts = $script:AllContacts.Count
+    $totalPages = [Math]::Ceiling($totalContacts / $script:PageSize)
+    
+    if ($script:CurrentPage -gt $totalPages -and $totalPages -gt 0) {
+        $script:CurrentPage = $totalPages
+    }
+    
+    if ($script:CurrentPage -lt 1) {
+        $script:CurrentPage = 1
+    }
+    
+    $startIndex = ($script:CurrentPage - 1) * $script:PageSize
+    $endIndex = [Math]::Min($startIndex + $script:PageSize - 1, $totalContacts - 1)
+    
+    $dataGridView.Rows.Clear()
+    
+    if ($totalContacts -gt 0) {
+        for ($i = $startIndex; $i -le $endIndex; $i++) {
+            $contact = $script:AllContacts[$i]
+            
+            $cloudManagedStatus = if ($contact.IsCloudManaged -is [string] -and $contact.IsCloudManaged -eq "Unknown") { 
+                "Unknown" 
+            } elseif ($contact.IsCloudManaged -eq $true) { 
+                "True" 
+            } else { 
+                "False" 
+            }
+            
+            $syncedStatus = if ($contact.SyncedOnPrem -eq $true) { "True" } else { "False" }
+            
+            $dataGridView.Rows.Add($contact.DisplayName, $contact.Mail, $contact.CompanyName, $syncedStatus, $cloudManagedStatus, $contact.Id)
+        }
+        
+        $showingCount = $endIndex - $startIndex + 1
+        $pageInfo.Text = "Page $($script:CurrentPage) of $totalPages - Showing $showingCount of $totalContacts contacts"
+    } else {
+        $pageInfo.Text = "No contacts to display"
+    }
+    
+    $buttonPrevPage.Enabled = ($script:CurrentPage -gt 1)
+    $buttonNextPage.Enabled = ($script:CurrentPage -lt $totalPages)
+}
+
+function Search-GraphModule {
+    Write-Log "Checking for Microsoft Graph Identity DirectoryManagement module..."
+    
+    $module = Get-Module -ListAvailable -Name Microsoft.Graph.Identity.DirectoryManagement
+    
+    if (-not $module) {
+        Write-Log "Microsoft.Graph.Identity.DirectoryManagement module not found. Attempting to install..." -Level WARNING
+        
+        try {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Microsoft.Graph.Identity.DirectoryManagement module is not installed.`n`nThe tool will now attempt to install it. This may take a few minutes.",
+                "Module Installation Required",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            
+            Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Write-Log "Microsoft.Graph.Identity.DirectoryManagement module installed successfully." -Level INFO
+            
+            [System.Windows.Forms.MessageBox]::Show(
+                "Microsoft.Graph.Identity.DirectoryManagement module has been installed successfully.",
+                "Installation Complete",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            
+            return $true
+        }
+        catch {
+            Write-Log "Failed to install Microsoft.Graph.Identity.DirectoryManagement module: $($_.Exception.Message)" -Level ERROR
+            
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to install Microsoft.Graph.Identity.DirectoryManagement module.`n`nError: $($_.Exception.Message)`n`nPlease install manually using:`nInstall-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser",
+                "Installation Failed",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            
+            return $false
+        }
+    }
+    else {
+        Write-Log "Microsoft.Graph.Identity.DirectoryManagement module is already installed (Version: $($module.Version))."
+        return $true
+    }
+}
+
+function Test-GraphPermissions {
+    Write-Log "Checking Graph permissions..."
+    
+    try {
+        $context = Get-MgContext
+        
+        if (-not $context) {
+            Write-Log "No Graph context found - not connected." -Level WARNING
+            $script:PermissionOk = $false
+            return $false
+        }
+        
+        $scopes = $context.Scopes
+        
+        if ($scopes -contains 'Contacts-OnPremisesSyncBehavior.ReadWrite.All') {
+            Write-Log "Required permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' is present."
+            $script:PermissionOk = $true
+            return $true
+        }
+        else {
+            Write-Log "Required permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' is NOT present." -Level WARNING
+            $script:PermissionOk = $false
+            return $false
+        }
+    }
+    catch {
+        Write-Log "Error checking permissions: $($_.Exception.Message)" -Level ERROR
+        $script:PermissionOk = $false
+        return $false
+    }
+}
+
+function Connect-GraphSession {
+    $tenantMsg = if ($script:TenantId) { "TenantId: $($script:TenantId)" } else { "default tenant" }
+    Write-Log "Attempting to connect to Microsoft Graph ($tenantMsg)..."
+    
+    try {
+        Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+        
+        if ($script:TenantId) {
+            Connect-MgGraph -Scopes 'OrgContact.Read.All','Contacts-OnPremisesSyncBehavior.ReadWrite.All' -TenantId $script:TenantId -ErrorAction Stop -NoWelcome
+        } else {
+            Connect-MgGraph -Scopes 'OrgContact.Read.All','Contacts-OnPremisesSyncBehavior.ReadWrite.All' -ErrorAction Stop -NoWelcome
+        }
+        
+        $context = Get-MgContext
+        Write-Log "Successfully connected to Microsoft Graph. TenantId: $($context.TenantId)"
+        
+        $form.Text = "Exchange Contacts SOA Conversion Tool - Tenant: $($context.TenantId)"
+        
+        if (Test-GraphPermissions) {
+            Write-Log "Permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' is already consented."
+            $script:PermissionOk = $true
+        }
+        else {
+            Write-Log "Permission missing. Triggering consent flow..." -Level WARNING
+            
+            Disconnect-MgGraph -ErrorAction SilentlyContinue
+            
+            if ($script:TenantId) {
+                Connect-MgGraph -Scopes 'OrgContact.Read.All','Contacts-OnPremisesSyncBehavior.ReadWrite.All' -TenantId $script:TenantId -ErrorAction Stop -NoWelcome
+            } else {
+                Connect-MgGraph -Scopes 'OrgContact.Read.All','Contacts-OnPremisesSyncBehavior.ReadWrite.All' -ErrorAction Stop -NoWelcome
+            }
+            
+            Write-Log "Consent flow completed."
+            
+            if (Test-GraphPermissions) {
+                Write-Log "Permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' successfully granted."
+                $script:PermissionOk = $true
+                
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' has been successfully granted.",
+                    "Permission Granted",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                )
+            }
+            else {
+                Write-Log "Permission was not granted after consent flow." -Level WARNING
+                $script:PermissionOk = $false
+                
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The permission was not granted. This may require admin consent.`n`nTo grant manually:`n1. Go to Entra admin center`n2. Navigate to Enterprise Applications`n3. Find 'Microsoft Graph Command Line Tools'`n4. Go to Permissions`n5. Click 'Grant admin consent'`n`nAlternatively, ask your Application Administrator or Cloud Application Administrator to grant consent.",
+                    "Permission Not Granted",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+            }
+        }
+        
+        return $true
+    }
+    catch {
+        Write-Log "Failed to connect to Microsoft Graph: $($_.Exception.Message)" -Level ERROR
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            "Failed to connect to Microsoft Graph.`n`nError: $($_.Exception.Message)",
+            "Connection Failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        
+        return $false
+    }
+}
+
+function Get-OrgContacts {
+    Write-Log "Retrieving organizational contacts from Microsoft Graph..."
+    
+    try {
+        $allContacts = @()
+        $uri = "https://graph.microsoft.com/v1.0/contacts?`$select=id,displayName,mail,companyName,onPremisesSyncEnabled&`$top=999"
+        
+        while ($uri) {
+            $response = Invoke-MgGraphRequest -Uri $uri -Method GET -ErrorAction Stop
+            
+            if ($response.value) {
+                $allContacts += $response.value
+            }
+            
+            $uri = $response.'@odata.nextLink'
+        }
+        
+        Write-Log "Retrieved $($allContacts.Count) total organizational contacts."
+        
+        $contactResults = @()
+        $totalCount = $allContacts.Count
+        $currentIndex = 0
+        
+        foreach ($contact in $allContacts) {
+            $currentIndex++
+            
+            if ($currentIndex % 10 -eq 0 -or $currentIndex -eq $totalCount) {
+                $statusLabel.Text = "Loading contact $currentIndex of $totalCount..."
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            
+            $isCloudManaged = $null
+            $soaRetries = 3
+            for ($r = 0; $r -lt $soaRetries; $r++) {
+                try {
+                    $uri = "https://graph.microsoft.com/v1.0/contacts/$($contact.Id)/onPremisesSyncBehavior?`$select=isCloudManaged"
+                    $soaResponse = Invoke-MgGraphRequest -Uri $uri -Method GET -ErrorAction Stop
+                    
+                    if ($null -ne $soaResponse) {
+                        if ($null -ne $soaResponse.isCloudManaged) {
+                            $isCloudManaged = if ($soaResponse.isCloudManaged -eq $true) { $true } else { $false }
+                        }
+                        else {
+                            Write-Log "Response received but isCloudManaged property is null for contact '$($contact.DisplayName)' ($($contact.Id))" -Level WARNING
+                            $isCloudManaged = "Unknown"
+                        }
+                    }
+                    else {
+                        Write-Log "Null response received for contact '$($contact.DisplayName)' ($($contact.Id))" -Level WARNING
+                        $isCloudManaged = "Unknown"
+                    }
+                    break
+                }
+                catch {
+                    if ($r -lt ($soaRetries - 1)) {
+                        Start-Sleep -Milliseconds 500
+                    }
+                    else {
+                        $errorDetails = $_.Exception.Message
+                        if ($_.ErrorDetails.Message) {
+                            try {
+                                $errorJson = $_.ErrorDetails.Message | ConvertFrom-Json
+                                if ($errorJson.error.message) {
+                                    $errorDetails = $errorJson.error.message
+                                }
+                            }
+                            catch {
+                                $errorDetails = $_.ErrorDetails.Message
+                            }
+                        }
+                        Write-Log "Could not retrieve SOA status for contact '$($contact.DisplayName)' ($($contact.Id)) after $soaRetries attempts: $errorDetails" -Level WARNING
+                        $isCloudManaged = "Unknown"
+                    }
+                }
+            }
+            
+            if ($null -eq $isCloudManaged) {
+                Write-Log "isCloudManaged is still null after all retries for contact '$($contact.DisplayName)' ($($contact.Id))" -Level WARNING
+                $isCloudManaged = "Unknown"
+            }
+            
+            $contactResults += [PSCustomObject]@{
+                Id              = $contact.Id
+                DisplayName     = $contact.DisplayName
+                Mail            = $contact.Mail
+                CompanyName     = $contact.CompanyName
+                SyncedOnPrem    = ($contact.OnPremisesSyncEnabled -eq $true)
+                IsCloudManaged  = $isCloudManaged
+            }
+        }
+        
+        Write-Log "Finished loading SOA status for all contacts."
+        
+        return $contactResults
+    }
+    catch {
+        $errorDetails = $_.Exception.Message
+        
+        $innerEx = $_.Exception
+        while ($innerEx.InnerException) {
+            $innerEx = $innerEx.InnerException
+        }
+        if ($innerEx.Message -and $innerEx.Message -ne $errorDetails) {
+            $errorDetails = $innerEx.Message
+        }
+        
+        if ($_.ErrorDetails.Message) {
+            try {
+                $errorJson = $_.ErrorDetails.Message | ConvertFrom-Json
+                if ($errorJson.error.message) {
+                    $errorDetails = $errorJson.error.message
+                }
+            }
+            catch {
+                $errorDetails = $_.ErrorDetails.Message
+            }
+        }
+        
+        Write-Log "Failed to retrieve contacts: $errorDetails" -Level ERROR
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            "Failed to retrieve contacts.`n`nError: $errorDetails",
+            "Retrieval Failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        
+        return $null
+    }
+}
+
+function Convert-ContactToCloudManaged {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SelectedContact
+    )
+    
+    $contactId = $SelectedContact.Id
+    $displayName = $SelectedContact.DisplayName
+    
+    Write-Log "Converting contact '$displayName' ($contactId) to Cloud Managed..."
+    
+    try {
+        $body = @{ isCloudManaged = $true } | ConvertTo-Json
+        $uri = "https://graph.microsoft.com/v1.0/contacts/$contactId/onPremisesSyncBehavior"
+        Invoke-MgGraphRequest -Uri $uri -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
+        
+        Write-Log "Successfully converted contact '$displayName' ($contactId) to Cloud Managed." -Level INFO
+        
+        return $true
+    }
+    catch {
+        Write-Log "Failed to convert contact '$displayName' ($contactId) to Cloud Managed. Error: $($_.Exception.Message)" -Level ERROR
+        
+        return $false
+    }
+}
+
+function Convert-ContactToOnPremManaged {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SelectedContact
+    )
+    
+    $contactId = $SelectedContact.Id
+    $displayName = $SelectedContact.DisplayName
+    
+    Write-Log "Rolling back contact '$displayName' ($contactId) to On-Premises Managed..."
+    
+    try {
+        $body = @{ isCloudManaged = $false } | ConvertTo-Json
+        $uri = "https://graph.microsoft.com/v1.0/contacts/$contactId/onPremisesSyncBehavior"
+        Invoke-MgGraphRequest -Uri $uri -Method PATCH -Body $body -ContentType "application/json" -ErrorAction Stop
+        
+        Write-Log "Successfully rolled back contact '$displayName' ($contactId) to On-Premises Managed." -Level INFO
+        
+        return $true
+    }
+    catch {
+        Write-Log "Failed to roll back contact '$displayName' ($contactId) to On-Premises Managed. Error: $($_.Exception.Message)" -Level ERROR
+        
+        return $false
+    }
+}
+
+# ============================================================
+# MAIN SCRIPT - GUI SETUP
+# ============================================================
+
+Write-Log "========================================" -Level INFO
+Write-Log "Exchange Contacts SOA Conversion Tool Started" -Level INFO
+if ($script:TenantId) {
+    Write-Log "Target TenantId: $($script:TenantId)" -Level INFO
+}
+Write-Log "========================================" -Level INFO
+
+if (-not (Search-GraphModule)) {
+    Write-Log "Cannot proceed without Microsoft Graph Identity DirectoryManagement module. Exiting." -Level ERROR
+    exit 1
+}
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Exchange Contacts SOA Conversion Tool"
+$form.Size = New-Object System.Drawing.Size(1100, 750)
+$form.MinimumSize = New-Object System.Drawing.Size(1100, 750)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$form.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F3F3")
+$form.ShowIcon = $false
+
+# --- Header Panel ---
+$headerPanel = New-Object System.Windows.Forms.Panel
+$headerPanel.Location = New-Object System.Drawing.Point(0, 0)
+$headerPanel.Size = New-Object System.Drawing.Size(1100, 90)
+$headerPanel.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E8E8E8")
+$headerPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($headerPanel)
+
+$labelTitle = New-Object System.Windows.Forms.Label
+$labelTitle.Location = New-Object System.Drawing.Point(20, 15)
+$labelTitle.Size = New-Object System.Drawing.Size(900, 40)
+$labelTitle.Text = "Exchange Contacts SOA Conversion Tool"
+$labelTitle.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Regular)
+$labelTitle.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$labelTitle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$labelTitle.BackColor = [System.Drawing.Color]::Transparent
+$labelTitle.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$headerPanel.Controls.Add($labelTitle)
+
+$pictureBoxLogo = New-Object System.Windows.Forms.PictureBox
+$pictureBoxLogo.Location = New-Object System.Drawing.Point(975, 8)
+$pictureBoxLogo.Size = New-Object System.Drawing.Size(100, 75)
+$pictureBoxLogo.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+$pictureBoxLogo.BackColor = [System.Drawing.Color]::Transparent
+$pictureBoxLogo.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+$logoPath = Join-Path $script:ScriptPath "logo.png"
+if (Test-Path $logoPath) {
+    try {
+        $fileStream = [System.IO.File]::OpenRead($logoPath)
+        $memoryStream = New-Object System.IO.MemoryStream
+        $fileStream.CopyTo($memoryStream)
+        $fileStream.Close()
+        $fileStream.Dispose()
+        $memoryStream.Position = 0
+        $pictureBoxLogo.Image = [System.Drawing.Image]::FromStream($memoryStream)
+    } catch {
+        Write-Log "Failed to load logo image: $($_.Exception.Message)" -Level WARNING
+    }
+}
+$headerPanel.Controls.Add($pictureBoxLogo)
+
+$labelDescription = New-Object System.Windows.Forms.Label
+$labelDescription.Location = New-Object System.Drawing.Point(20, 58)
+$labelDescription.Size = New-Object System.Drawing.Size(900, 25)
+$labelDescription.Text = "Convert Contact Source of Authority for Exchange on-premises mail contacts (Organizational Contacts)"
+$labelDescription.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$labelDescription.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
+$labelDescription.BackColor = [System.Drawing.Color]::Transparent
+$labelDescription.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$labelDescription.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$headerPanel.Controls.Add($labelDescription)
+
+# --- Connection Buttons Row ---
+$buttonConnect = New-Object System.Windows.Forms.Button
+$buttonConnect.Location = New-Object System.Drawing.Point(20, 105)
+$buttonConnect.Size = New-Object System.Drawing.Size(170, 40)
+$buttonConnect.Text = "Connect to Graph"
+$buttonConnect.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
+$buttonConnect.ForeColor = [System.Drawing.Color]::White
+$buttonConnect.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$buttonConnect.FlatAppearance.BorderSize = 0
+$buttonConnect.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonConnect.Add_Click({
+    $buttonConnect.Enabled = $false
+    $buttonRefresh.Enabled = $false
+    
+    if (Connect-GraphSession) {
+        $buttonConnect.Text = "Connected"
+        $buttonConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#107C10")
+        $buttonConnect.Enabled = $false
+        $buttonRefresh.Enabled = $true
+        $buttonDisconnect.Enabled = $true
+        
+        $contacts = Get-OrgContacts
+        
+        if ($contacts) {
+            $script:CurrentPage = 1
+            Update-ContactGrid -Contacts $contacts
+            $statusLabel.Text = "Connected - $($contacts.Count) contacts loaded"
+        }
+    }
+    else {
+        $buttonConnect.Enabled = $true
+    }
+})
+$form.Controls.Add($buttonConnect)
+
+$buttonRefresh = New-Object System.Windows.Forms.Button
+$buttonRefresh.Location = New-Object System.Drawing.Point(205, 105)
+$buttonRefresh.Size = New-Object System.Drawing.Size(150, 40)
+$buttonRefresh.Text = "Refresh Contacts"
+$buttonRefresh.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonRefresh.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonRefresh.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonRefresh.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$buttonRefresh.FlatAppearance.BorderSize = 0
+$buttonRefresh.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonRefresh.Enabled = $false
+$buttonRefresh.Add_Click({
+    $buttonRefresh.Enabled = $false
+    
+    $contacts = Get-OrgContacts
+    
+    if ($contacts) {
+        $script:CurrentPage = 1
+        Update-ContactGrid -Contacts $contacts
+        $statusLabel.Text = "Refreshed - $($contacts.Count) contacts loaded"
+    }
+    
+    $buttonRefresh.Enabled = $true
+})
+$form.Controls.Add($buttonRefresh)
+
+$buttonDisconnect = New-Object System.Windows.Forms.Button
+$buttonDisconnect.Location = New-Object System.Drawing.Point(370, 105)
+$buttonDisconnect.Size = New-Object System.Drawing.Size(180, 40)
+$buttonDisconnect.Text = "Disconnect from Graph"
+$buttonDisconnect.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonDisconnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonDisconnect.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonDisconnect.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$buttonDisconnect.FlatAppearance.BorderSize = 0
+$buttonDisconnect.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonDisconnect.Enabled = $false
+$buttonDisconnect.Add_Click({
+    Write-Log "Disconnecting from Microsoft Graph..."
+    
+    try {
+        Disconnect-MgGraph -ErrorAction Stop
+        Write-Log "Successfully disconnected from Microsoft Graph."
+        
+        $form.Text = "Exchange Contacts SOA Conversion Tool"
+        $buttonConnect.Text = "Connect to Graph"
+        $buttonConnect.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
+        $buttonConnect.Enabled = $true
+        $buttonRefresh.Enabled = $false
+        $buttonDisconnect.Enabled = $false
+        
+        $script:PermissionOk = $false
+        
+        $dataGridView.Rows.Clear()
+        
+        $statusLabel.Text = "Disconnected"
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            "Successfully disconnected from Microsoft Graph.",
+            "Disconnected",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+    catch {
+        Write-Log "Error during disconnect: $($_.Exception.Message)" -Level WARNING
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            "An error occurred while disconnecting.`n`nError: $($_.Exception.Message)",
+            "Disconnect Warning",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+    }
+})
+$form.Controls.Add($buttonDisconnect)
+
+# --- Hide Converted Contacts Checkbox ---
+$checkboxHideConverted = New-Object System.Windows.Forms.CheckBox
+$checkboxHideConverted.Location = New-Object System.Drawing.Point(565, 105)
+$checkboxHideConverted.Size = New-Object System.Drawing.Size(200, 40)
+$checkboxHideConverted.Text = "Hide Converted Contacts"
+$checkboxHideConverted.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$checkboxHideConverted.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$checkboxHideConverted.Cursor = [System.Windows.Forms.Cursors]::Hand
+$checkboxHideConverted.Checked = $false
+$checkboxHideConverted.Add_CheckedChanged({
+    $script:HideConverted = $checkboxHideConverted.Checked
+    $script:CurrentPage = 1
+    Update-ContactGrid
+    
+    $filteredCount = $script:AllContacts.Count
+    $totalCount = $script:AllContactsUnfiltered.Count
+    
+    if ($script:HideConverted) {
+        $hiddenCount = $totalCount - $filteredCount
+        $statusLabel.Text = "Hiding $hiddenCount converted contact(s) - Showing $filteredCount of $totalCount contacts"
+    } else {
+        $statusLabel.Text = "Showing all $totalCount contacts"
+    }
+})
+$form.Controls.Add($checkboxHideConverted)
+
+# --- DataGridView ---
+$dataGridView = New-Object System.Windows.Forms.DataGridView
+$dataGridView.Location = New-Object System.Drawing.Point(20, 155)
+$dataGridView.Size = New-Object System.Drawing.Size(1060, 370)
+$dataGridView.AllowUserToAddRows = $false
+$dataGridView.AllowUserToDeleteRows = $false
+$dataGridView.ReadOnly = $true
+$dataGridView.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+$dataGridView.MultiSelect = $true
+$dataGridView.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+$dataGridView.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$dataGridView.BackgroundColor = [System.Drawing.Color]::White
+$dataGridView.GridColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$dataGridView.DefaultCellStyle.BackColor = [System.Drawing.Color]::White
+$dataGridView.DefaultCellStyle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$dataGridView.DefaultCellStyle.SelectionBackColor = [System.Drawing.ColorTranslator]::FromHtml("#0078D4")
+$dataGridView.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+$dataGridView.DefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$dataGridView.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F9F9F9")
+$dataGridView.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$dataGridView.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$dataGridView.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$dataGridView.ColumnHeadersDefaultCellStyle.Alignment = [System.Windows.Forms.DataGridViewContentAlignment]::MiddleLeft
+$dataGridView.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(5, 0, 0, 0)
+$dataGridView.ColumnHeadersHeight = 40
+$dataGridView.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::DisableResizing
+$dataGridView.EnableHeadersVisualStyles = $false
+$dataGridView.RowHeadersVisible = $false
+$dataGridView.CellBorderStyle = [System.Windows.Forms.DataGridViewCellBorderStyle]::SingleHorizontal
+$dataGridView.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+
+$colDisplayName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colDisplayName.Name = "DisplayName"
+$colDisplayName.HeaderText = "Display Name"
+$colDisplayName.FillWeight = 25
+[void]$dataGridView.Columns.Add($colDisplayName)
+
+$colEmail = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colEmail.Name = "Email"
+$colEmail.HeaderText = "Email Address"
+$colEmail.FillWeight = 27
+[void]$dataGridView.Columns.Add($colEmail)
+
+$colCompany = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colCompany.Name = "Company"
+$colCompany.HeaderText = "Company"
+$colCompany.FillWeight = 20
+[void]$dataGridView.Columns.Add($colCompany)
+
+$colSyncedOnPrem = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colSyncedOnPrem.Name = "SyncedOnPrem"
+$colSyncedOnPrem.HeaderText = "Synced from On-Prem"
+$colSyncedOnPrem.FillWeight = 14
+[void]$dataGridView.Columns.Add($colSyncedOnPrem)
+
+$colCloudManaged = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colCloudManaged.Name = "IsCloudManaged"
+$colCloudManaged.HeaderText = "Cloud Managed"
+$colCloudManaged.FillWeight = 14
+[void]$dataGridView.Columns.Add($colCloudManaged)
+
+$colObjectId = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colObjectId.Name = "ObjectId"
+$colObjectId.HeaderText = "Object ID"
+$colObjectId.Visible = $false
+[void]$dataGridView.Columns.Add($colObjectId)
+
+# Add column header click event for sorting
+$dataGridView.Add_ColumnHeaderMouseClick({
+    param($sender, $e)
+    
+    $columnName = $sender.Columns[$e.ColumnIndex].Name
+    
+    # Don't sort on ObjectId column
+    if ($columnName -eq "ObjectId") {
+        return
+    }
+    
+    # Toggle sort direction if clicking the same column
+    if ($script:SortColumn -eq $columnName) {
+        $script:SortDirection = if ($script:SortDirection -eq "Ascending") { "Descending" } else { "Ascending" }
+    } else {
+        $script:SortColumn = $columnName
+        $script:SortDirection = "Ascending"
+    }
+    
+    # Reset to page 1 when sorting
+    $script:CurrentPage = 1
+    
+    # Update the grid with sorted data
+    Update-ContactGrid
+})
+
+$form.Controls.Add($dataGridView)
+
+# --- Pagination ---
+$buttonPrevPage = New-Object System.Windows.Forms.Button
+$buttonPrevPage.Location = New-Object System.Drawing.Point(20, 570)
+$buttonPrevPage.Size = New-Object System.Drawing.Size(100, 30)
+$buttonPrevPage.Text = "< Previous"
+$buttonPrevPage.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonPrevPage.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonPrevPage.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonPrevPage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$buttonPrevPage.FlatAppearance.BorderSize = 0
+$buttonPrevPage.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonPrevPage.Enabled = $false
+$buttonPrevPage.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$buttonPrevPage.Add_Click({
+    if ($script:CurrentPage -gt 1) {
+        $script:CurrentPage--
+        Update-ContactGrid
+    }
+})
+$form.Controls.Add($buttonPrevPage)
+
+$pageInfo = New-Object System.Windows.Forms.Label
+$pageInfo.Location = New-Object System.Drawing.Point(130, 570)
+$pageInfo.Size = New-Object System.Drawing.Size(650, 30)
+$pageInfo.Text = "No contacts to display"
+$pageInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$pageInfo.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
+$pageInfo.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$pageInfo.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($pageInfo)
+
+$buttonNextPage = New-Object System.Windows.Forms.Button
+$buttonNextPage.Location = New-Object System.Drawing.Point(790, 570)
+$buttonNextPage.Size = New-Object System.Drawing.Size(100, 30)
+$buttonNextPage.Text = "Next >"
+$buttonNextPage.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonNextPage.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonNextPage.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonNextPage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$buttonNextPage.FlatAppearance.BorderSize = 0
+$buttonNextPage.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonNextPage.Enabled = $false
+$buttonNextPage.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$buttonNextPage.Add_Click({
+    $totalPages = [Math]::Ceiling($script:AllContacts.Count / $script:PageSize)
+    if ($script:CurrentPage -lt $totalPages) {
+        $script:CurrentPage++
+        Update-ContactGrid
+    }
+})
+$form.Controls.Add($buttonNextPage)
+
+# --- Action Buttons ---
+$buttonConvertToCloud = New-Object System.Windows.Forms.Button
+$buttonConvertToCloud.Location = New-Object System.Drawing.Point(20, 610)
+$buttonConvertToCloud.Size = New-Object System.Drawing.Size(230, 45)
+$buttonConvertToCloud.Text = "Convert to Cloud Managed"
+$buttonConvertToCloud.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonConvertToCloud.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonConvertToCloud.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonConvertToCloud.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$buttonConvertToCloud.FlatAppearance.BorderSize = 0
+$buttonConvertToCloud.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonConvertToCloud.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$buttonConvertToCloud.Add_Click({
+    if (-not $script:PermissionOk) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "The required permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' is not consented.`n`nPlease reconnect to Graph to grant the required permission.",
+            "Permission Required",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+    
+    if ($dataGridView.SelectedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Please select at least one contact from the list.",
+            "No Contact Selected",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+    
+    $selectedContacts = @()
+    foreach ($selectedRow in $dataGridView.SelectedRows) {
+        $contactId = $selectedRow.Cells["ObjectId"].Value
+        $contact = $script:AllContacts | Where-Object { $_.Id -eq $contactId }
+        if ($contact) {
+            $selectedContacts += $contact
+        }
+    }
+    
+    $selectedCount = $selectedContacts.Count
+    $contactList = ($selectedContacts | ForEach-Object { $_.DisplayName }) -join "`n"
+    
+    $confirmMessage = if ($selectedCount -eq 1) {
+        "Are you sure you want to convert contact '$($selectedContacts[0].DisplayName)' to Cloud Managed?"
+    } else {
+        "Are you sure you want to convert $selectedCount contacts to Cloud Managed?`n`nContacts to convert:`n$contactList"
+    }
+    
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        $confirmMessage,
+        "Confirm Conversion",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    
+    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $successCount = 0
+        $failCount = 0
+        
+        foreach ($contact in $selectedContacts) {
+            $statusLabel.Text = "Converting '$($contact.DisplayName)'..."
+            [System.Windows.Forms.Application]::DoEvents()
+            
+            if (Convert-ContactToCloudManaged -SelectedContact $contact) {
+                $contact.IsCloudManaged = $true
+                
+                foreach ($row in $dataGridView.Rows) {
+                    if ($row.Cells["ObjectId"].Value -eq $contact.Id) {
+                        $row.Cells["IsCloudManaged"].Value = "True"
+                        break
+                    }
+                }
+                
+                $successCount++
+            } else {
+                $failCount++
+            }
+        }
+        
+        $summaryMessage = "Batch conversion completed.`n`nSuccessful: $successCount`nFailed: $failCount"
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            $summaryMessage,
+            "Batch Conversion Summary",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+        
+        $statusLabel.Text = "Conversion complete - Success: $successCount, Failed: $failCount"
+        Write-Log "Batch conversion to Cloud Managed completed. Success: $successCount, Failed: $failCount"
+    }
+})
+$form.Controls.Add($buttonConvertToCloud)
+
+$buttonConvertToOnPrem = New-Object System.Windows.Forms.Button
+$buttonConvertToOnPrem.Location = New-Object System.Drawing.Point(265, 610)
+$buttonConvertToOnPrem.Size = New-Object System.Drawing.Size(230, 45)
+$buttonConvertToOnPrem.Text = "Roll Back to On-Prem"
+$buttonConvertToOnPrem.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonConvertToOnPrem.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonConvertToOnPrem.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonConvertToOnPrem.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$buttonConvertToOnPrem.FlatAppearance.BorderSize = 0
+$buttonConvertToOnPrem.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonConvertToOnPrem.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$buttonConvertToOnPrem.Add_Click({
+    if (-not $script:PermissionOk) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "The required permission 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' is not consented.`n`nPlease reconnect to Graph to grant the required permission.",
+            "Permission Required",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+    
+    if ($dataGridView.SelectedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Please select at least one contact from the list.",
+            "No Contact Selected",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
+    }
+    
+    $selectedContacts = @()
+    foreach ($selectedRow in $dataGridView.SelectedRows) {
+        $contactId = $selectedRow.Cells["ObjectId"].Value
+        $contact = $script:AllContacts | Where-Object { $_.Id -eq $contactId }
+        if ($contact) {
+            $selectedContacts += $contact
+        }
+    }
+    
+    $selectedCount = $selectedContacts.Count
+    $contactList = ($selectedContacts | ForEach-Object { $_.DisplayName }) -join "`n"
+    
+    $confirmMessage = if ($selectedCount -eq 1) {
+        "Are you sure you want to roll back contact '$($selectedContacts[0].DisplayName)' to On-Premises Managed?`n`nIMPORTANT: Make sure the contact still exists in on-premises Active Directory before rolling back."
+    } else {
+        "Are you sure you want to roll back $selectedCount contacts to On-Premises Managed?`n`nContacts to roll back:`n$contactList`n`nIMPORTANT: Make sure the contacts still exist in on-premises Active Directory before rolling back."
+    }
+    
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        $confirmMessage,
+        "Confirm Rollback",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    
+    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $successCount = 0
+        $failCount = 0
+        
+        foreach ($contact in $selectedContacts) {
+            $statusLabel.Text = "Rolling back '$($contact.DisplayName)'..."
+            [System.Windows.Forms.Application]::DoEvents()
+            
+            if (Convert-ContactToOnPremManaged -SelectedContact $contact) {
+                $contact.IsCloudManaged = $false
+                
+                foreach ($row in $dataGridView.Rows) {
+                    if ($row.Cells["ObjectId"].Value -eq $contact.Id) {
+                        $row.Cells["IsCloudManaged"].Value = "False"
+                        break
+                    }
+                }
+                
+                $successCount++
+            } else {
+                $failCount++
+            }
+        }
+        
+        $summaryMessage = "Batch rollback completed.`n`nSuccessful: $successCount`nFailed: $failCount`n`nNote: The rollback is only complete after the next scheduled or forced run of Connect Sync."
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            $summaryMessage,
+            "Batch Rollback Summary",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+        
+        $statusLabel.Text = "Rollback complete - Success: $successCount, Failed: $failCount"
+        Write-Log "Batch rollback to On-Premises Managed completed. Success: $successCount, Failed: $failCount"
+    }
+})
+$form.Controls.Add($buttonConvertToOnPrem)
+
+$buttonOpenLog = New-Object System.Windows.Forms.Button
+$buttonOpenLog.Location = New-Object System.Drawing.Point(510, 610)
+$buttonOpenLog.Size = New-Object System.Drawing.Size(160, 45)
+$buttonOpenLog.Text = "Open Log File"
+$buttonOpenLog.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$buttonOpenLog.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#E1E1E1")
+$buttonOpenLog.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#1F1F1F")
+$buttonOpenLog.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+$buttonOpenLog.FlatAppearance.BorderSize = 0
+$buttonOpenLog.Cursor = [System.Windows.Forms.Cursors]::Hand
+$buttonOpenLog.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$buttonOpenLog.Add_Click({
+    if (Test-Path $script:LogFile) {
+        try {
+            Start-Process notepad.exe -ArgumentList $script:LogFile
+            Write-Log "Log file opened: $script:LogFile"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to open log file.`n`nError: $($_.Exception.Message)",
+                "Error Opening Log",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+    }
+    else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Log file does not exist yet.`n`nPath: $script:LogFile",
+            "Log File Not Found",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+})
+$form.Controls.Add($buttonOpenLog)
+
+# --- Status and Version Labels ---
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Location = New-Object System.Drawing.Point(685, 610)
+$statusLabel.Size = New-Object System.Drawing.Size(395, 20)
+$statusLabel.Text = "Not connected"
+$statusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$statusLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#605E5C")
+$statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$statusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($statusLabel)
+
+$versionLabel = New-Object System.Windows.Forms.Label
+$versionLabel.Location = New-Object System.Drawing.Point(685, 635)
+$versionLabel.Size = New-Object System.Drawing.Size(395, 20)
+$versionLabel.Text = "Version $script:Version"
+$versionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+$versionLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#808080")
+$versionLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$versionLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$form.Controls.Add($versionLabel)
+
+# --- Resize Handler ---
+$form.Add_Resize({
+    $buttonY = $form.ClientSize.Height - 105
+    $buttonConvertToCloud.Location = New-Object System.Drawing.Point(20, $buttonY)
+    $buttonConvertToOnPrem.Location = New-Object System.Drawing.Point(265, $buttonY)
+    $buttonOpenLog.Location = New-Object System.Drawing.Point(510, $buttonY)
+    
+    $statusY = $form.ClientSize.Height - 105
+    $statusLabel.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 415), $statusY)
+    
+    $versionY = $form.ClientSize.Height - 80
+    $versionLabel.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 415), $versionY)
+    
+    $paginationY = $buttonY - 40
+    $buttonPrevPage.Location = New-Object System.Drawing.Point(20, $paginationY)
+    $pageInfo.Location = New-Object System.Drawing.Point(130, $paginationY)
+    $pageInfo.Size = New-Object System.Drawing.Size(($form.ClientSize.Width - 270), 30)
+    $buttonNextPage.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - 120), $paginationY)
+    
+    $gridHeight = $paginationY - 165
+    $dataGridView.Size = New-Object System.Drawing.Size(($form.ClientSize.Width - 40), $gridHeight)
+})
+
+# --- Form Closing Handler ---
+$form.Add_FormClosing({
+    Write-Log "Exchange Contacts SOA Conversion Tool Closing" -Level INFO
+    
+    try {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue
+        Write-Log "Disconnected from Microsoft Graph." -Level INFO
+    }
+    catch {
+        Write-Log "Error during disconnect: $($_.Exception.Message)" -Level WARNING
+    }
+    
+    if ($pictureBoxLogo.Image) {
+        $pictureBoxLogo.Image.Dispose()
+    }
+})
+
+[void]$form.ShowDialog()
+
+Write-Log "========================================" -Level INFO
+Write-Log "Exchange Contacts SOA Conversion Tool Ended" -Level INFO
+Write-Log "========================================" -Level INFO
