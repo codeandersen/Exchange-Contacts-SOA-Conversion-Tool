@@ -32,10 +32,10 @@
         C:\PS> .\Exchange-Contacts-SOA-Conversion-Tool.ps1 -TenantId "00000000-0000-0000-0000-000000000000"
 
         .NOTES
-        Version: 1.00
+        Version: 1.01
         
         REQUIREMENTS:
-        - Microsoft.Graph.Identity.DirectoryManagement PowerShell module
+        - Microsoft.Graph.Authentication PowerShell module
         - Consent to the 'Contacts-OnPremisesSyncBehavior.ReadWrite.All' permission in Microsoft Graph
           (The tool will automatically prompt for consent when you connect)
 
@@ -58,7 +58,7 @@ param(
     [string]$TenantId
 )
 
-$script:Version = "1.00"
+$script:Version = "1.01"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -204,50 +204,97 @@ function Update-ContactGrid {
     $buttonNextPage.Enabled = ($script:CurrentPage -lt $totalPages)
 }
 
-function Search-GraphModule {
-    Write-Log "Checking for Microsoft Graph Identity DirectoryManagement module..."
-    
-    $module = Get-Module -ListAvailable -Name Microsoft.Graph.Identity.DirectoryManagement
-    
+function Initialize-GraphModule {
+    $script:GraphModuleName = 'Microsoft.Graph.Authentication'
+    Write-Log "Checking for $script:GraphModuleName module..."
+    Write-Log "PSModulePath: $env:PSModulePath"
+
+    $module = Get-Module -ListAvailable -Name $script:GraphModuleName | Sort-Object Version -Descending | Select-Object -First 1
+
     if (-not $module) {
-        Write-Log "Microsoft.Graph.Identity.DirectoryManagement module not found. Attempting to install..." -Level WARNING
-        
+        Write-Log "$script:GraphModuleName module not found. Attempting to install..." -Level WARNING
+
         try {
             [System.Windows.Forms.MessageBox]::Show(
-                "Microsoft.Graph.Identity.DirectoryManagement module is not installed.`n`nThe tool will now attempt to install it. This may take a few minutes.",
+                "$script:GraphModuleName module is not installed.`n`nThe tool will now attempt to install it. This may take a few minutes.",
                 "Module Installation Required",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
-            
-            Install-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-            Write-Log "Microsoft.Graph.Identity.DirectoryManagement module installed successfully." -Level INFO
-            
+
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $scope = if ($isAdmin) { 'AllUsers' } else { 'CurrentUser' }
+            Write-Log "Installing $script:GraphModuleName with scope '$scope' (elevated: $isAdmin)."
+
+            Install-Module -Name $script:GraphModuleName -Scope $scope -Repository PSGallery -Force -AllowClobber -ErrorAction Stop
+            Write-Log "$script:GraphModuleName module installed successfully." -Level INFO
+
             [System.Windows.Forms.MessageBox]::Show(
-                "Microsoft.Graph.Identity.DirectoryManagement module has been installed successfully.",
+                "$script:GraphModuleName module has been installed successfully.",
                 "Installation Complete",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
-            
-            return $true
+
+            $module = Get-Module -ListAvailable -Name $script:GraphModuleName | Sort-Object Version -Descending | Select-Object -First 1
         }
         catch {
-            Write-Log "Failed to install Microsoft.Graph.Identity.DirectoryManagement module: $($_.Exception.Message)" -Level ERROR
-            
+            Write-Log "Failed to install $script:GraphModuleName module: $($_.Exception.Message)" -Level ERROR
+
             [System.Windows.Forms.MessageBox]::Show(
-                "Failed to install Microsoft.Graph.Identity.DirectoryManagement module.`n`nError: $($_.Exception.Message)`n`nPlease install manually using:`nInstall-Module -Name Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser",
+                "Failed to install $script:GraphModuleName module.`n`nError: $($_.Exception.Message)`n`nPlease install manually from an elevated PowerShell window:`nInstall-Module -Name $script:GraphModuleName -Scope AllUsers`n`nIf the module is installed but still not found, check that `$env:PSModulePath contains the Modules folder shown by:`nGet-InstalledModule $script:GraphModuleName | Select-Object InstalledLocation",
                 "Installation Failed",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Error
             )
-            
+
             return $false
         }
     }
     else {
-        Write-Log "Microsoft.Graph.Identity.DirectoryManagement module is already installed (Version: $($module.Version))."
+        Write-Log "$script:GraphModuleName module is already installed (Version: $($module.Version))."
+    }
+
+    if (-not $module) {
+        $installed = Get-InstalledModule -Name $script:GraphModuleName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+        if ($installed -and $installed.InstalledLocation) {
+            $modulesRoot = Split-Path -Parent (Split-Path -Parent $installed.InstalledLocation)
+            if (($env:PSModulePath -split ';') -notcontains $modulesRoot) {
+                $env:PSModulePath = "$modulesRoot;$env:PSModulePath"
+                Write-Log "Module is installed but '$modulesRoot' is not in PSModulePath - added it for this session." -Level WARNING
+            }
+            $module = Get-Module -ListAvailable -Name $script:GraphModuleName | Sort-Object Version -Descending | Select-Object -First 1
+        }
+    }
+
+    try {
+        Import-Module $script:GraphModuleName -ErrorAction Stop
+        Write-Log "$script:GraphModuleName module imported (Version: $((Get-Module $script:GraphModuleName).Version))."
         return $true
+    }
+    catch {
+        Write-Log "Import of $script:GraphModuleName by name failed: $($_.Exception.Message). Trying manifest path..." -Level WARNING
+
+        try {
+            $installed = Get-InstalledModule -Name $script:GraphModuleName -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1
+            Import-Module (Join-Path $installed.InstalledLocation "$script:GraphModuleName.psd1") -ErrorAction Stop
+            Write-Log "$script:GraphModuleName module imported from '$($installed.InstalledLocation)'."
+            return $true
+        }
+        catch {
+            Write-Log "Failed to import $script:GraphModuleName module: $($_.Exception.Message)" -Level ERROR
+
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to load $script:GraphModuleName module.`n`nError: $($_.Exception.Message)`n`nPlease install manually from an elevated PowerShell window:`nInstall-Module -Name $script:GraphModuleName -Scope AllUsers`n`nIf the module is installed but still not found, check that `$env:PSModulePath contains the Modules folder shown by:`nGet-InstalledModule $script:GraphModuleName | Select-Object InstalledLocation",
+                "Module Load Failed",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+
+            return $false
+        }
     }
 }
 
@@ -288,8 +335,6 @@ function Connect-GraphSession {
     Write-Log "Attempting to connect to Microsoft Graph ($tenantMsg)..."
     
     try {
-        Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
-        
         if ($script:TenantId) {
             Connect-MgGraph -Scopes 'OrgContact.Read.All','Contacts-OnPremisesSyncBehavior.ReadWrite.All' -TenantId $script:TenantId -ErrorAction Stop -NoWelcome
         } else {
@@ -554,8 +599,8 @@ if ($script:TenantId) {
 }
 Write-Log "========================================" -Level INFO
 
-if (-not (Search-GraphModule)) {
-    Write-Log "Cannot proceed without Microsoft Graph Identity DirectoryManagement module. Exiting." -Level ERROR
+if (-not (Initialize-GraphModule)) {
+    Write-Log "Cannot proceed without $script:GraphModuleName module. Exiting." -Level ERROR
     exit 1
 }
 

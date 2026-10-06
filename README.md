@@ -12,7 +12,7 @@ GUI tool to manage Contact Source of Authority (SOA) conversion between cloud-ma
 ## Prerequisites
 
 - PowerShell 5.1 or later
-- Microsoft.Graph.Identity.DirectoryManagement PowerShell module (auto-installed if missing)
+- Microsoft.Graph.Authentication PowerShell module (auto-installed if missing; installed with `AllUsers` scope when run elevated, otherwise `CurrentUser`)
 - Consent to the `Contacts-OnPremisesSyncBehavior.ReadWrite.All` permission in Microsoft Graph (tool prompts for consent on first connect)
 
 ## Usage
@@ -33,6 +33,24 @@ GUI tool to manage Contact Source of Authority (SOA) conversion between cloud-ma
 4. Click **Roll Back to On-Prem** to set `isCloudManaged = false` (change completes after next Connect Sync cycle).
 5. Use **Hide Converted Contacts** to filter the list.
 6. Logs are written to `ContactSOAConversion_yyyyMMdd_HHmm.log` next to the script.
+
+## Troubleshooting
+
+**Install-Module reports success, but the tool still says the module cannot be found/imported**
+
+This usually means the folder where the module was installed is not in `$env:PSModulePath` for the session — common on Exchange or managed servers where a user-level `PSModulePath` is set or Documents is redirected. The tool detects this and adds the folder to `PSModulePath` for the current session (logged as a WARNING). If it still fails, run these diagnostics in the same PowerShell window:
+
+```powershell
+$env:PSModulePath -split ';'
+[Environment]::GetFolderPath('MyDocuments')
+Get-InstalledModule Microsoft.Graph.Authentication | Select-Object Version, InstalledLocation
+```
+
+The `Modules` folder that is the grandparent of `InstalledLocation` must appear in `$env:PSModulePath`. To fix permanently, install for all users from an elevated PowerShell window (installs to `C:\Program Files\WindowsPowerShell\Modules`, which is always on the path):
+
+```powershell
+Install-Module -Name Microsoft.Graph.Authentication -Scope AllUsers
+```
 
 ## Documentation
 
